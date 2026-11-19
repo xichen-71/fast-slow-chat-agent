@@ -1,4 +1,4 @@
-"""状态只由主循环修改；后台线程只计算，完成后由 poll 验货。"""
+"""V2：Fast 说话/建议动作；主线程校验执行；单 worker 只产出 Analysis。"""
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -7,11 +7,14 @@ from typing import Callable
 from uuid import uuid4
 
 from .config import Config
-from .fast import FastChannel
+from .fast import FastAgent
 from .llm import LLM
 from .memory import Memory
-from .schemas import Analysis, ChatReply
-from .slow import SlowChannel
+from .schemas import Action, ActionExecutionResult, AgentError, Analysis, ChatReply
+from .slow import SlowAgent
+
+COMMANDS = {"/status": "get_status", "/result": "get_result",
+            "/cancel": "cancel_slow", "/discard": "discard_result"}
 
 
 @dataclass
@@ -20,7 +23,6 @@ class TaskState:
     user_request: str
     context: list[dict[str, str]]
     analysis_task: str
-    revision: int = 1
     status: str = "running"
     actions: list[dict] = field(default_factory=list)
     result: Analysis | None = None
@@ -30,188 +32,208 @@ class TaskState:
     delivered: bool = False
     started: float = field(default_factory=perf_counter)
 
-    def brief(self) -> dict:
+    def brief(self):
         return {"task_id": self.task_id, "user_request": self.user_request,
-                "analysis_task": self.analysis_task, "revision": self.revision,
-                "status": self.status, "notified": self.notified, "delivered": self.delivered}
+                "analysis_task": self.analysis_task, "status": self.status,
+                "result_available": self.result is not None, "topic_switched": self.topic_switched,
+                "notified": self.notified, "delivered": self.delivered, "error": self.error}
 
 
 class Workflow:
     def __init__(self, llm: LLM, memory: Memory, config: Config,
                  trace: Callable[[str, dict], None] | None = None):
-        self.fast = FastChannel(llm)
-        self.slow = SlowChannel(llm)
-        self.memory = memory
-        self.config = config
+        self.fast, self.slow = FastAgent(llm), SlowAgent(llm)
+        self.memory, self.config = memory, config
         self.trace = trace or (lambda event, data: None)
         self.state: TaskState | None = None
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="slow")
-        self.pending: tuple[str, int, Future] | None = None
-        # 未提交给线程池的最新快照；连续修改只覆盖这个位置。
-        self.waiting: tuple[str, int, str, list[dict[str, str]], str] | None = None
+        self.pending: tuple[str, Future] | None = None
+        self.waiting: tuple[str, str, list, str] | None = None
+        self.completion_event: tuple[str, str] | None = None
         self.closed = False
 
-    def _reply(self, answer: str, channel="fast", reason="任务管理", started=None) -> ChatReply:
-        self.memory.add("assistant", answer)
-        return ChatReply(answer, channel, reason, perf_counter() - started if started else 0)
-
-    def _schedule(self):
-        state = self.state
-        snapshot = (state.task_id, state.revision, state.user_request,
-                    [dict(m) for m in state.context], state.analysis_task)
-        if self.pending is not None:
-            self.waiting = snapshot
-            self.trace("slow_queued_latest", {"task_id": state.task_id, "revision": state.revision})
-        else:
-            self._submit(snapshot)
-
     def _submit(self, snapshot):
-        task_id, revision, message, history, task = snapshot
+        task_id, message, history, task = snapshot
         future = self.executor.submit(self.slow.analyze, message, history, task)
-        self.pending = (task_id, revision, future)
-        self.trace("slow_start", {"task_id": task_id, "revision": revision, "task": task})
+        self.pending = (task_id, future)
+        self.trace("slow_start", {"task_id": task_id, "task": task})
 
-    def _start(self, message, history, task, acknowledgement, started):
-        self.state = TaskState(uuid4().hex[:10], message, history, task)
-        self.state.actions.append({"type": "reasoning", "status": "running",
-                                   "revision": 1, "summary": task})
-        self._schedule()
-        return self._reply(acknowledgement or "好，我仔细想一下，你可以继续问别的。", started=started)
-
-    def _replace(self, history, task, acknowledgement, started):
-        state = self.state
-        old_task = state.analysis_task
-        state.actions[-1]["status"] = "superseded"
-        state.revision += 1
-        state.analysis_task = task
-        state.context = history
-        state.status = "running"
-        state.result = None
-        state.error = None
-        state.notified = state.delivered = state.topic_switched = False
-        state.started = perf_counter()
-        state.actions.append({"type": "reasoning", "status": "running",
-                              "revision": state.revision, "summary": task})
-        self.trace("task_revised", {"task_id": state.task_id, "revision": state.revision,
-                                    "before": old_task, "after": task})
-        self._schedule()
-        return self._reply(acknowledgement, started=started)
-
-    def _deliver(self, started=None):
-        state = self.state
-        if not state or state.status != "completed" or state.result is None:
-            return self._reply(self.fast.notice("status", state.brief() if state else None), started=started)
-        self.trace("compose_start", {"task_id": state.task_id})
-        # 原任务问题和快照仍保留，防止用新话题替换原问题。
-        answer = self.fast.compose(state.analysis_task, state.context, state.result)
-        state.delivered = True
-        return self._reply(answer, "slow", "慢分析后由快通道整理", started)
-
-    def handle(self, message: str, mode: str = "auto") -> ChatReply:
-        if self.closed:
-            raise ValueError("会话已关闭")
-        if mode not in {"auto", "fast", "slow"} or not message.strip():
-            raise ValueError("消息不能为空，模式必须为 auto/fast/slow")
-        started = perf_counter()
-        history = self.memory.recent(self.config.history_turns, self.config.history_max_chars)
-        self.memory.add("user", message)
-        brief = self.state.brief() if self.state else None
-        commands = {"/status": "status", "/result": "show_result", "/cancel": "cancel", "/discard": "discard"}
-        target_task_id = brief["task_id"] if message in commands and brief else None
-        acknowledgement = ""
-        task = "根据用户要求和上下文深入分析"
-        reason = "实验者强制慢分析"
-        if message in commands:
-            action = commands[message]
-            reason = "用户明确任务管理命令"
-        elif mode == "slow":
-            action = "start_slow"
+    def _create(self, message, history, task):
+        self.completion_event = None
+        self.state = TaskState(uuid4().hex[:10], message, [dict(m) for m in history], task)
+        self.state.actions.append({"type": "reasoning", "status": "running", "summary": task})
+        snapshot = (self.state.task_id, message, self.state.context, task)
+        if self.pending:
+            self.waiting = snapshot
+            self.trace("slow_queued_latest", {"task_id": self.state.task_id})
         else:
-            self.trace("fast_start", {})
-            phase = perf_counter()
-            result = self.fast.respond(message, history, brief)
-            self.trace("fast_done", {"seconds": perf_counter() - phase})
-            action, reason = result.action, result.route_reason
-            task = result.analysis_task
-            acknowledgement = result.answer
-            target_task_id = result.target_task_id
-        self.trace("route", {"action": action, "reason": reason})
-        state = self.state
-        if action in {"replace", "cancel", "discard", "status", "show_result", "defer"} and message not in commands:
-            if state is None or target_task_id != state.task_id:
-                return self._reply("你指的是当前哪个任务？我先不修改或取消，请确认一下。", started=started)
-        if action in {"cancel", "discard"}:
-            if state:
-                state.status = "cancelled"
-                state.result = None
-                self.waiting = None
-                state.actions[-1]["status"] = "cancelled"
-                if self.pending:
-                    self.pending[2].cancel()
-            return self._reply(self.fast.notice(action, brief), started=started)
-        if action == "status":
-            return self._reply(self.fast.notice("status", brief), started=started)
-        if action == "show_result":
-            return self._deliver(started)
-        if action == "defer":
-            if state:
-                state.notified = True
-                state.topic_switched = True
-            return self._reply("好，结果先留着，你想看时再告诉我。" if state else "目前没有需要暂存的任务。", started=started)
-        if action in {"start_slow", "replace"}:
-            if mode == "fast":
-                return self._reply("当前是强制 FAST 模式，未启动慢任务。可切换 /mode auto 后重试。", started=started)
-            if action == "replace":
-                if state is None or state.status == "cancelled":
-                    return self._reply("原任务已不可修改，请重新提出完整问题。", started=started)
-                return self._replace(history, task, acknowledgement, started)
-            if state and state.status == "running":
-                return self._reply(self.fast.notice("busy", brief), started=started)
-            elif state and state.status == "completed" and not state.delivered:
-                return self._reply("上一个问题已经有结果，还没给你看。要先看结果，还是丢弃后再处理这个问题？", started=started)
-            return self._start(message, history, task, acknowledgement, started)
-        if state and state.status in {"running", "completed"} and not state.delivered:
-            state.topic_switched = True
-        return self._reply(acknowledgement, reason=reason, started=started)
+            try:
+                self._submit(snapshot)
+            except Exception:
+                self.state.status = "failed"
+                self.state.error = "SLOW_SUBMIT_FAILED"
+                self.state.actions[-1]["status"] = "failed"
+                raise AgentError("SLOW_SUBMIT_FAILED") from None
 
-    def poll(self) -> ChatReply | None:
-        """主循环周期调用；只处理一次完成事件，不在后台线程发送消息。"""
-        if not self.pending or not self.pending[2].done():
-            return None
-        task_id, revision, future = self.pending
+    def sync(self):
+        """先同步状态，不调用 Fast、不输出；用户路由前与动作执行前均可调用。"""
+        if self.closed or not self.pending or not self.pending[1].done():
+            return
+        task_id, future = self.pending
         self.pending = None
         state = self.state
-        if not state or state.task_id != task_id or state.revision != revision or state.status != "running":
-            self.trace("slow_ignored", {"task_id": task_id, "revision": revision})
+        if not state or state.task_id != task_id or state.status != "running":
+            self.trace("slow_ignored", {"task_id": task_id})
             snapshot, self.waiting = self.waiting, None
-            if snapshot and state and state.status == "running" and snapshot[:2] == (state.task_id, state.revision):
-                self._submit(snapshot)
-            return None
+            if snapshot and state and state.status == "running" and snapshot[0] == state.task_id:
+                try:
+                    self._submit(snapshot)
+                except Exception:
+                    state.status, state.error = "failed", "SLOW_SUBMIT_FAILED"
+                    state.actions[-1]["status"] = "failed"
+                    self.completion_event = (state.task_id, "slow_failed")
+            return
         try:
             state.result = future.result()
+            state.status = "completed"
+            state.actions[-1]["status"] = "completed"
+            event = "slow_completed"
         except Exception:
-            state.status = "failed"
-            state.error = "慢分析失败或超时；未生成可用结果"
+            state.status, state.error = "failed", "SLOW_ANALYSIS_FAILED_OR_TIMEOUT"
             state.actions[-1]["status"] = "failed"
-            self.trace("slow_failed", {"task_id": task_id, "error": state.error})
-            return self._reply("刚才的分析没能完成，你可以重试。")
-        state.status = "completed"
-        state.actions[-1]["status"] = "completed"
-        self.trace("slow_done", {"task_id": task_id, "revision": revision, "seconds": perf_counter() - state.started,
-                                 "analysis": asdict(state.result)})
-        if state.topic_switched:
-            if not state.notified:
-                state.notified = True
-                return self._reply("刚才那个问题我想好了，现在要听吗？")
+            event = "slow_failed"
+        self.completion_event = (task_id, event)
+        self.trace(event, {"task_id": task_id, "seconds": perf_counter() - state.started,
+                           "analysis": asdict(state.result) if state.result else None, "error": state.error})
+
+    def _context(self, event, message, history, mode, feedback=None):
+        state = self.state
+        # 已完成的小型 Analysis 提供给 Fast，允许用户自然地要求查看，无需再走 compose 协议。
+        return {"event": event, "message": message, "history": history,
+                "task_state": state.brief() if state else None,
+                "analysis_result": asdict(state.result) if state and state.result else None,
+                "mode": mode, "explicit_intent": COMMANDS.get(message) if event == "user_message" else None,
+                "execution_result": asdict(feedback) if feedback else None}
+
+    def _feedback(self, action, accepted, reason):
+        state = self.state
+        return ActionExecutionResult(accepted, action.type, state.task_id if state else None,
+                                     state.status if state else None, reason)
+
+    def _execute(self, action: Action, context):
+        state = self.state
+        kind = action.type
+        expected = context["explicit_intent"]
+        if expected and kind != expected and not (state is None and kind == "none"):
+            return self._feedback(action, False, "COMMAND_ACTION_MISMATCH")
+        if context["event"] != "user_message" and kind not in {"none", "get_result", "defer_result", "get_status"}:
+            return self._feedback(action, False, "EVENT_ACTION_FORBIDDEN")
+        if kind == "none":
+            if (context["event"] == "user_message" and context["mode"] == "slow"
+                    and not expected and (not state or state.status in {"failed", "cancelled"} or state.delivered)):
+                return self._feedback(action, False, "MODE_REQUIRES_SLOW")
+            return self._feedback(action, True, "NO_ACTION")
+        if kind not in {"start_slow", "get_status"} or action.target_task_id is not None:
+            if not state or action.target_task_id != state.task_id:
+                return self._feedback(action, False, "TARGET_MISMATCH")
+        if kind == "get_status":
+            if state and action.target_task_id != state.task_id:
+                return self._feedback(action, False, "TARGET_MISMATCH")
+        elif kind in {"start_slow", "update_slow"}:
+            if context["mode"] == "fast":
+                return self._feedback(action, False, "FAST_MODE_FORBIDS_SLOW")
+            if kind == "start_slow" and state:
+                if state.status == "running":
+                    return self._feedback(action, False, "SLOW_BUSY")
+                if state.status == "completed" and not state.delivered:
+                    return self._feedback(action, False, "UNDELIVERED_RESULT")
+            if kind == "update_slow" and state.status == "cancelled":
+                return self._feedback(action, False, "TASK_CANCELLED")
+            original = state.user_request if kind == "update_slow" else context["message"]
+            if kind == "update_slow":
+                state.status = "cancelled"
+                state.actions[-1]["status"] = "superseded"
+                self.trace("task_updated", {"old_task_id": state.task_id, "before": state.analysis_task,
+                                            "after": action.task})
+            self._create(original, context["history"], action.task)
+        elif kind in {"cancel_slow", "discard_result"}:
+            state.status, state.result = "cancelled", None
+            state.actions[-1]["status"] = "cancelled"
+            self.waiting = self.completion_event = None
+            if self.pending:
+                self.pending[1].cancel()
+        elif kind == "get_result":
+            if state.status != "completed" or not state.result:
+                return self._feedback(action, False, "RESULT_NOT_READY")
+            if context["analysis_result"] is None:
+                return self._feedback(action, False, "RESULT_NOT_IN_FAST_INPUT")
+        elif kind == "defer_result":
+            if state.status not in {"running", "completed"}:
+                return self._feedback(action, False, "NO_ACTIVE_RESULT")
+            state.notified, state.topic_switched = True, True
+        return self._feedback(action, True, "EXECUTED")
+
+    def _turn(self, context):
+        started = perf_counter()
+        response = self.fast.respond(context)
+        self.trace("fast_decision", {"event": context["event"], **asdict(response)})
+        # Fast 调用期间 Slow 可能完成，先更新，再执行动作。
+        self.sync()
+        changed = context["task_state"] != (self.state.brief() if self.state else None)
+        feedback = self._execute(response.action, context)
+        self.trace("action_execution", asdict(feedback))
+        channel = "slow" if feedback.accepted and response.action.type == "get_result" else "fast"
+        if not feedback.accepted or changed:
+            # 不重试动作，最多调用 Fast 修正一次自然语言回复。
+            if changed and feedback.accepted:
+                feedback = self._feedback(response.action, True, "STATE_CHANGED_ACTION_EXECUTED")
+            correction = self._context("action_failed", context["message"], context["history"], context["mode"], feedback)
+            response = self.fast.respond(correction)
+            if response.action.type != "none" or response.respond is None:
+                raise AgentError("FAST_CORRECTION_INVALID：动作未重试，请查询 /status")
+            self.trace("fast_corrected", asdict(response))
+        if response.respond is None:
             return None
-        return self._deliver()
+        # 最终输出确定后才记反馈标志和 assistant 历史。
+        if channel == "slow" and self.state:
+            self.state.delivered = True
+        if context["event"] in {"slow_completed", "slow_failed"} and self.state:
+            self.state.notified = True
+        if (context["event"] == "user_message" and response.action.type == "none"
+                and self.state and self.state.status in {"running", "completed"} and not self.state.delivered
+                and not context["explicit_intent"]):
+            # 可选 relation；缺省保守当作切话题。只改一个受限字段。
+            if response.topic_relation != "same_task":
+                self.state.topic_switched = True
+        self.memory.add("assistant", response.respond)
+        return ChatReply(response.respond, channel, response.route_reason, perf_counter() - started)
+
+    def handle(self, message: str, mode: str = "auto") -> ChatReply:
+        if self.closed or mode not in {"auto", "fast", "slow"} or not message.strip():
+            raise ValueError("会话关闭、消息为空或模式无效")
+        self.sync()
+        history = self.memory.recent(self.config.history_turns, self.config.history_max_chars)
+        self.memory.add("user", message)
+        return self._turn(self._context("user_message", message, history, mode))
+
+    def poll(self) -> ChatReply | None:
+        self.sync()
+        if self.closed or not self.completion_event:
+            return None
+        task_id, event = self.completion_event
+        self.completion_event = None
+        if not self.state or self.state.task_id != task_id or self.state.notified or self.state.delivered:
+            return None
+        history = self.memory.recent(self.config.history_turns, self.config.history_max_chars)
+        # 消费事件至多一次；失败时仍可通过 /status 或 /result 恢复。
+        self.state.notified = True
+        return self._turn(self._context(event, None, history, "auto"))
 
     def close(self):
         self.closed = True
-        self.waiting = None
+        self.waiting = self.completion_event = None
         if self.state and self.state.status == "running":
             self.state.status = "cancelled"
         if self.pending:
-            self.pending[2].cancel()
-        # 已发出的 HTTP 无法硬停止；由请求超时收尾，结果不会再输出。
+            self.pending[1].cancel()
         self.executor.shutdown(wait=False, cancel_futures=True)

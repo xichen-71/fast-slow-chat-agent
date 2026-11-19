@@ -16,35 +16,62 @@ def text(data: dict[str, Any], key: str, *, required: bool = False) -> str:
 
 
 @dataclass(frozen=True)
-class FastResult:
-    need_slow: bool
-    answer: str
-    analysis_task: str
-    route_reason: str
-    action: str
+class Action:
+    type: str
+    task: str | None = None
     target_task_id: str | None = None
 
     @classmethod
-    def parse(cls, data: dict[str, Any]) -> "FastResult":
-        actions = {"direct", "start_slow", "status", "show_result", "cancel", "replace", "defer", "discard"}
-        action = text(data, "action", required=True)
-        if action not in actions:
-            raise AgentError("未知的快通道 action")
-        slow = action in {"start_slow", "replace"}
-        task = text(data, "analysis_task", required=slow)
-        if not slow and task:
-            raise AgentError("非慢任务的 analysis_task 必须为空")
-        target = data.get("target_task_id")
-        task_actions = {"replace", "cancel", "discard", "status", "show_result", "defer"}
+    def parse(cls, data: Any) -> "Action":
+        allowed = {"none", "start_slow", "update_slow", "cancel_slow", "get_status",
+                   "get_result", "defer_result", "discard_result"}
+        if not isinstance(data, dict) or not isinstance(data.get("type"), str) or data["type"] not in allowed:
+            raise AgentError("action.type 不在白名单中")
+        kind, task, target = data["type"], data.get("task"), data.get("target_task_id")
+        if kind in {"start_slow", "update_slow"}:
+            if not isinstance(task, str) or not task.strip():
+                raise AgentError("启动或修改必须提供完整 task")
+        elif task is not None:
+            raise AgentError("此动作的 task 必须为 null")
         if target is not None and (not isinstance(target, str) or not target.strip()):
             raise AgentError("target_task_id 必须为非空字符串或 null")
-        if action == "replace" and target is None:
-            raise AgentError("replace 必须提供 target_task_id")
-        if action not in task_actions and target is not None:
-            raise AgentError("新任务和直接回答的 target_task_id 必须为 null")
-        return cls(slow, text(data, "answer", required=True),
-                   task,
-                   text(data, "route_reason", required=True), action, target)
+        if kind in {"none", "start_slow"} and target is not None:
+            raise AgentError("none/start_slow 不允许 target_task_id")
+        if kind not in {"none", "start_slow", "get_status"} and target is None:
+            raise AgentError("当前动作必须指定 target_task_id")
+        return cls(kind, task.strip() if task else None, target)
+
+
+@dataclass(frozen=True)
+class FastResponse:
+    respond: str | None
+    action: Action
+    route_reason: str = ""
+    topic_relation: str = "unknown"
+
+    @classmethod
+    def parse(cls, data: dict[str, Any], *, allow_silent=False) -> "FastResponse":
+        action = Action.parse(data.get("action"))
+        respond = data.get("respond")
+        if respond is None:
+            if not allow_silent or action.type != "none":
+                raise AgentError("仅系统事件的 none 动作允许 respond=null")
+        elif not isinstance(respond, str) or not respond.strip():
+            raise AgentError("respond 必须为非空字符串")
+        relation = data.get("topic_relation", "unknown")
+        reason = data.get("route_reason", "")
+        if relation not in {"same_task", "other_topic", "unknown"} or not isinstance(reason, str):
+            raise AgentError("无效的 topic_relation 或 route_reason")
+        return cls(respond.strip() if respond else None, action, reason, relation)
+
+
+@dataclass(frozen=True)
+class ActionExecutionResult:
+    accepted: bool
+    action_type: str
+    task_id: str | None
+    status: str | None
+    reason_code: str
 
 
 @dataclass(frozen=True)

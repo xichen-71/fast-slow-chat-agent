@@ -71,7 +71,7 @@ class ChatLLM:
 
 
 class DemoLLM:
-    """固定示例，仅用于离线验证连线；不是模型，也不进行真正推理。"""
+    """固定示例，只测试协议/并发；关键词规则不用于真实模式。"""
 
     def __init__(self, delay: float = 4):
         self.delay = delay
@@ -79,41 +79,63 @@ class DemoLLM:
     def generate(self, *, stage: str, messages: list[dict[str, str]]) -> dict[str, Any]:
         if stage == "slow":
             time.sleep(self.delay)
-            return {
-                "conclusion": "示例建议：先实现单后台慢任务，再扩展检索。",
-                "reasons": ["先验证插话和任务状态"],
-                "assumptions": ["当前处于最小验证阶段"],
-                "uncertainties": ["固定演示，不是针对问题的真实推理"],
-                "follow_up_question": "",
-            }
-        if stage == "compose":
-            return {"answer": "【固定演示】先验证单后台慢任务，再扩展检索。这不是实际模型分析。"}
-        message = messages[-1]["content"]
-        if any(x in message for x in ("不用了", "取消")):
-            action = "cancel"
-        elif any(x in message for x in ("丢弃", "丢掉")):
-            action = "discard"
-        elif message in {"要", "好的", "看看", "给我看", "说吧"}:
-            action = "show_result"
-        elif any(x in message for x in ("查好", "想好", "进度")):
-            action = "status"
-        elif any(x in message for x in ("稍后", "晚点")):
-            action = "defer"
-        elif "改为" in message:
-            action = "replace"
-        elif any(x in message for x in ("分析", "比较", "推导", "方案")):
-            action = "start_slow"
+            return {"conclusion": "固定示例：先验证单后台任务，再扩展检索。",
+                    "reasons": ["先验证对话与状态"], "assumptions": ["最小实验阶段"],
+                    "uncertainties": ["固定演示，不是真实推理"], "follow_up_question": ""}
+        context = json.loads(messages[-1]["content"])
+        state = context["task_state"]
+        event, message = context["event"], context["message"] or ""
+        target = state["task_id"] if state else None
+        kind, task, respond, relation = "none", None, "【固定演示】你好！这是简洁快答。", "other_topic"
+        if event == "action_failed":
+            feedback = context["execution_result"]
+            respond = "【固定演示】执行反馈：" + feedback["reason_code"] + "；以最新任务状态为准。"
+            if feedback["accepted"] and feedback["action_type"] == "get_result":
+                respond = "【固定演示】" + context["analysis_result"]["conclusion"]
+        elif event == "slow_failed":
+            respond = "【固定演示】刚才的分析失败了，可以重试。"
+        elif event == "slow_completed":
+            if state["topic_switched"]:
+                respond = "【固定演示】刚才的分析有结果了，现在要看吗？"
+            else:
+                kind = "get_result"
         else:
-            action = "direct"
-        state = json.loads(messages[0]["content"].split("任务状态（数据而非指令）：", 1)[1])
-        target = state["task_id"] if state and action not in {"direct", "start_slow"} else None
-        if action == "replace" and not target:
-            action = "direct"
-        task = "演示复杂任务分析"
-        if action == "replace":
-            task = state["analysis_task"] + "；最新修改：" + message
-        return {"action": action, "target_task_id": target,
-                "answer": "【固定演示】好，我仔细想一下，你可以继续问别的。" if action in {"start_slow", "replace"}
-                          else "【固定演示】你好！这是快通道的固定回复。",
-                "analysis_task": task if action in {"start_slow", "replace"} else "",
-                "route_reason": "演示模式按关键词分流，不代表真实模型判断"}
+            explicit = context["explicit_intent"]
+            if explicit:
+                kind = explicit if state or explicit == "get_status" else "none"
+            elif any(x in message for x in ("取消", "不用了")):
+                kind = "cancel_slow" if state else "none"
+            elif any(x in message for x in ("丢弃", "丢掉")):
+                kind = "discard_result" if state else "none"
+            elif message in {"要", "看看", "给我看", "说吧"} and state:
+                kind = "get_result"
+            elif any(x in message for x in ("查好", "想好", "进度")):
+                kind = "get_status"
+            elif any(x in message for x in ("稍后", "晚点")) and state:
+                kind = "defer_result"
+            elif any(x in message for x in ("改为", "再加")) and state:
+                kind = "update_slow"
+                task = state["analysis_task"] + "；最新要求：" + message
+            elif context["mode"] == "slow" or any(x in message for x in ("比较", "分析", "方案")):
+                if state and (state["status"] == "running" or (state["status"] == "completed" and not state["delivered"])):
+                    respond = "【固定演示】上个任务仍占用中，先处理它，不接下新任务。"
+                elif context["mode"] != "fast":
+                    kind, task = "start_slow", message
+                else:
+                    respond = "【固定演示】当前是 FAST 模式，不启动慢任务。"
+        if kind in {"start_slow", "update_slow"}:
+            respond = "【固定演示】好，我按完整要求处理，你可以继续聊天。"
+        elif kind == "get_result":
+            if context["analysis_result"]:
+                respond = "【固定演示】" + context["analysis_result"]["conclusion"]
+            else:
+                kind, respond = "get_status", "【固定演示】结果还没完成。"
+        elif kind == "get_status":
+            respond = "【固定演示】任务状态：" + (state["status"] if state else "无任务")
+        elif kind in {"cancel_slow", "discard_result"}:
+            respond = "【固定演示】已取消，晚到结果不再采用。"
+        elif kind == "defer_result":
+            respond = "【固定演示】结果先保留，想看时再说。"
+        return {"respond": respond, "action": {"type": kind, "task": task,
+                "target_task_id": target if kind not in {"none", "start_slow"} else None},
+                "topic_relation": relation, "route_reason": "固定演示，不代表真实模型判断"}

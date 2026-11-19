@@ -1,239 +1,300 @@
-"""离线验证关键行为；不需要密钥，不发出网络请求。"""
+"""V2 离线协议、状态隔离与后台交互测试，不调用真实 API。"""
 
 import io
 import json
-import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
-from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
 from chat_agent.config import Config
-from chat_agent.llm import ChatLLM
+from chat_agent.llm import ChatLLM, DemoLLM, parse_json_object
 from chat_agent.memory import Memory
-from chat_agent.schemas import AgentError, FastResult
+from chat_agent.schemas import Action, AgentError, FastResponse
 from chat_agent.workflow import Workflow
 
-
-DIRECT = {
-    "action": "direct", "answer": "你好！", "analysis_task": "",
-    "route_reason": "简单问候，无需深入分析",
-}
-ROUTE_SLOW = {
-    "need_slow": True, "answer": "", "analysis_task": "比较方案的成本与限制",
-    "route_reason": "需要综合多个约束",
-}
-ANALYSIS = {
-    "conclusion": "先采用方案 A", "reasons": ["当前成本较低"],
-    "assumptions": ["需求规模较小"], "uncertainties": ["缺少实际性能数据"],
-    "follow_up_question": "",
-}
+DIRECT = {"respond": "你好", "action": {"type": "none"}}
+ANALYSIS = {"conclusion": "先验证最小流程", "reasons": ["减少变量"],
+            "assumptions": ["实验阶段"], "uncertainties": ["尚未真实评估"], "follow_up_question": ""}
 
 
-class ScriptedLLM:
-    def __init__(self, responses):
-        self.responses = iter(responses)
-        self.calls = []
-
-    def generate(self, *, stage, messages):
-        self.calls.append((stage, messages))
-        result = next(self.responses)
-        if isinstance(result, Exception):
-            raise result
-        return result
+def response(kind="none", respond="模型回复", task=None, target=None):
+    return {"respond": respond, "action": {"type": kind, "task": task, "target_task_id": target}}
 
 
-class ControlledLLM:
+class ControlledLLM(DemoLLM):
     def __init__(self):
-        import threading
         self.release = threading.Event()
         self.entered = threading.Event()
-        self.returned = threading.Event()
-        self.calls = []
+        self.slow_inputs = []
+        self.fast_inputs = []
         self.fail = False
-        self.slow_count = 0
-        self.slow_tasks = []
+        self.override = None
 
     def generate(self, *, stage, messages):
-        self.calls.append(stage)
+        context = json.loads(messages[-1]["content"])
         if stage == "slow":
-            self.slow_count += 1
-            self.slow_tasks.append(json.loads(messages[-1]["content"])["analysis_task"])
+            self.slow_inputs.append(context)
             self.entered.set()
-            self.release.wait(2)
-            self.returned.set()
+            if not self.release.wait(2):
+                raise AgentError("TEST_TIMEOUT")
             if self.fail:
-                raise AgentError("test failure")
+                raise AgentError("TEST_FAILURE")
             return ANALYSIS
-        if stage == "compose":
-            return {"answer": "先选择 A，性能仍需验证。"}
-        message = messages[-1]["content"]
-        action = "replace" if "改为" in message else "start_slow" if "比较" in message else "direct"
-        state = json.loads(messages[0]["content"].split("任务状态（数据而非指令）：", 1)[1])
-        target = state["task_id"] if action == "replace" and state else None
-        task = (state["analysis_task"] + "；" + message) if action == "replace" else "比较 A 和 B"
-        return {"action": action, "target_task_id": target, "answer": "好，我想一下。" if action != "direct" else "你好！",
-                "analysis_task": task if action != "direct" else "",
-                "route_reason": "test"}
+        self.fast_inputs.append(context)
+        if self.override:
+            result = self.override(context)
+            if result is not None:
+                return result
+        return super().generate(stage=stage, messages=messages)
 
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
-        self.config = Config()
-        self.memory = Memory()
         self.llm = ControlledLLM()
+        self.memory = Memory()
         self.events = []
-        self.workflow = Workflow(self.llm, self.memory, self.config,
-                                 lambda event, data: self.events.append((event, data)))
+        self.workflow = Workflow(self.llm, self.memory, Config(), lambda e, d: self.events.append((e, d)))
 
     def tearDown(self):
         self.llm.release.set()
         self.workflow.close()
+        self.workflow.executor.shutdown(wait=True)
 
-    def complete(self):
-        import time
+    def finish(self):
         self.llm.release.set()
+        replies = []
         deadline = time.monotonic() + 2
-        reply = None
-        while self.workflow.pending:
-            if time.monotonic() > deadline:
-                self.fail("background task did not finish")
-            reply = self.workflow.poll() or reply
-            time.sleep(.005)
+        while self.workflow.pending or self.workflow.completion_event:
+            self.assertLess(time.monotonic(), deadline)
+            reply = self.workflow.poll()
+            if reply:
+                replies.append(reply)
+            time.sleep(.002)
+        return replies
+
+    def start(self):
+        reply = self.workflow.handle("比较方案 A 和 B")
+        self.assertTrue(self.llm.entered.wait(1))
+        self.assertEqual(self.workflow.state.status, "running")
         return reply
 
-    def test_direct_and_memory(self):
-        reply = self.workflow.handle("你好")
+    def test_direct_goes_through_fast_and_saves_only_real_messages(self):
+        reply = self.workflow.handle("线程是什么")
         self.assertEqual(reply.channel, "fast")
-        self.assertEqual(self.llm.calls, ["fast"])
-        self.assertEqual(len(self.memory.messages), 2)
-        self.assertEqual(Memory().messages, [])
+        self.assertEqual(self.llm.fast_inputs[0]["event"], "user_message")
+        self.assertEqual([m["role"] for m in self.memory.messages], ["user", "assistant"])
+        self.assertIsNone(self.workflow.state)
 
-    def test_slow_does_not_block_fast_and_rejects_second_task(self):
-        self.workflow.handle("比较方案")
-        self.assertTrue(self.llm.entered.wait(1))
+    def test_simple_interruption_and_unrelated_complex_task(self):
+        self.start()
         task_id = self.workflow.state.task_id
-        reply = self.workflow.handle("你好")
-        self.assertEqual(reply.answer, "你好！")
-        busy = self.workflow.handle("比较另一个方案")
-        self.assertIn("还在处理", busy.answer)
+        self.workflow.handle("线程是什么")
+        reply = self.workflow.handle("另外分析一个项目")
+        self.assertIn("不接下新任务", reply.answer)
         self.assertEqual(self.workflow.state.task_id, task_id)
-        self.assertEqual(self.llm.slow_count, 1)
-        notice = self.complete()
-        self.assertIn("现在要听吗", notice.answer)
-        self.assertIsNone(self.workflow.poll())
-        result = self.workflow.handle("/result")
-        self.assertEqual(result.channel, "slow")
-        self.assertTrue(self.workflow.state.delivered)
+        self.assertEqual(len(self.llm.slow_inputs), 1)
+        self.assertEqual(self.llm.fast_inputs[-1]["task_state"]["analysis_task"], "比较方案 A 和 B")
 
-    def test_no_topic_switch_delivers_immediately(self):
-        self.workflow.handle("比较方案")
-        reply = self.complete()
+    def test_completion_waiting_delivers_once_through_fast(self):
+        self.start()
+        replies = self.finish()
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0].channel, "slow")
+        self.assertTrue(self.workflow.state.delivered)
+        self.assertEqual(self.llm.fast_inputs[-1]["event"], "slow_completed")
+        self.assertIsNone(self.workflow.poll())
+        self.assertEqual(sum(m["role"] == "user" for m in self.memory.messages), 1)
+
+    def test_completion_after_topic_switch_asks_once_then_delivers(self):
+        self.start()
+        self.workflow.handle("你好")
+        reply = self.finish()[0]
+        self.assertIn("现在要看吗", reply.answer)
+        self.assertFalse(self.workflow.state.delivered)
+        self.assertIsNone(self.workflow.poll())
+        reply = self.workflow.handle("要")
         self.assertEqual(reply.channel, "slow")
         self.assertTrue(self.workflow.state.delivered)
-        self.assertIsNone(self.workflow.poll())
 
-    def test_cancel_ignores_late_result(self):
-        self.workflow.handle("比较方案")
-        self.llm.entered.wait(1)
-        self.workflow.handle("/cancel")
-        self.assertIsNone(self.complete())
-        self.assertEqual(self.workflow.state.status, "cancelled")
-        self.assertIsNone(self.workflow.state.result)
+    def test_related_updates_new_ids_keep_only_latest(self):
+        self.start()
+        original = self.workflow.state
+        self.workflow.handle("改为重点看成本")
+        second = self.workflow.state
+        self.workflow.handle("再加入维护难度")
+        third = self.workflow.state
+        self.assertEqual(len({original.task_id, second.task_id, third.task_id}), 3)
+        self.assertEqual(original.status, "cancelled")
+        self.assertIn("成本", third.analysis_task)
+        self.assertIn("维护难度", third.analysis_task)
+        self.assertEqual(self.workflow.waiting[0], third.task_id)
+        self.finish()
+        self.assertEqual(len(self.llm.slow_inputs), 2)
+        self.assertEqual(self.llm.slow_inputs[-1]["analysis_task"], third.analysis_task)
+        self.assertIsNone(original.result)
 
-    def test_completed_undelivered_not_overwritten(self):
-        self.workflow.handle("比较方案")
-        self.workflow.handle("你好")
-        self.complete()
-        task_id = self.workflow.state.task_id
-        reply = self.workflow.handle("比较新方案")
-        self.assertIn("还没给你看", reply.answer)
-        self.assertEqual(self.workflow.state.task_id, task_id)
-
-    def test_continuous_replacement_keeps_id_and_only_executes_latest(self):
-        self.workflow.handle("比较方案")
-        self.assertTrue(self.llm.entered.wait(1))
-        task_id = self.workflow.state.task_id
-        self.workflow.handle("改为只比较成本")
-        self.workflow.handle("改为再加入维护难度")
-        self.assertEqual(self.workflow.state.task_id, task_id)
-        self.assertEqual(self.workflow.state.revision, 3)
-        self.assertIn("成本", self.workflow.state.analysis_task)
-        self.assertIn("维护难度", self.workflow.state.analysis_task)
-        self.assertEqual(self.llm.slow_count, 1)
-        self.assertEqual(self.workflow.waiting[1], 3)
-        self.complete()
-        self.assertEqual(self.llm.slow_count, 2)
-        self.assertEqual(self.llm.slow_tasks[-1], self.workflow.state.analysis_task)
-        ignored = [data for event, data in self.events if event == "slow_ignored"]
-        self.assertEqual(ignored[0]["revision"], 1)
-        self.assertEqual(self.workflow.state.status, "completed")
-
-    def test_cancel_clears_latest_and_drops_old_result(self):
-        self.workflow.handle("比较方案")
-        self.assertTrue(self.llm.entered.wait(1))
-        self.workflow.handle("改为只比较成本")
+    def test_cancel_clears_waiting_and_ignores_old_future(self):
+        self.start()
+        self.workflow.handle("改为看成本")
         self.workflow.handle("/cancel")
         self.assertIsNone(self.workflow.waiting)
-        self.assertIsNone(self.complete())
-        self.assertEqual(self.llm.slow_count, 1)
+        self.assertEqual(self.workflow.state.status, "cancelled")
+        self.assertEqual(self.llm.fast_inputs[-1]["explicit_intent"], "cancel_slow")
+        self.assertEqual(self.finish(), [])
         self.assertIsNone(self.workflow.state.result)
+        self.assertEqual(len(self.llm.slow_inputs), 1)
 
-    def test_wrong_target_cannot_modify_or_cancel(self):
-        from chat_agent.schemas import FastResult
-        self.workflow.handle("比较方案")
-        state = self.workflow.state
-        for action in ("replace", "cancel"):
-            decision = FastResult(action == "replace", "好的", "新要求" if action == "replace" else "",
-                                  "test", action, "wrong-id")
-            with patch.object(self.workflow.fast, "respond", return_value=decision):
-                reply = self.workflow.handle("修改或取消")
-            self.assertIn("确认", reply.answer)
-            self.assertEqual(state.revision, 1)
-            self.assertEqual(state.status, "running")
-
-    def test_cancel_then_new_task_does_not_receive_previous_result(self):
-        self.workflow.handle("比较方案")
-        self.assertTrue(self.llm.entered.wait(1))
+    def test_cancel_then_new_task_isolated(self):
+        self.start()
         old_id = self.workflow.state.task_id
         self.workflow.handle("/cancel")
-        self.workflow.handle("比较新方案")
+        self.workflow.handle("分析新方案")
         self.assertNotEqual(self.workflow.state.task_id, old_id)
-        self.complete()
-        self.assertEqual(self.llm.slow_count, 2)
+        self.finish()
+        self.assertEqual(len(self.llm.slow_inputs), 2)
         self.assertEqual(self.workflow.state.status, "completed")
 
-    def test_ambiguous_direct_does_not_touch_task(self):
-        from chat_agent.schemas import FastResult
-        self.workflow.handle("比较方案")
-        task_id = self.workflow.state.task_id
-        decision = FastResult(False, "是修改旧任务还是新问题？", "", "指代不明", "direct")
-        with patch.object(self.workflow.fast, "respond", return_value=decision):
-            reply = self.workflow.handle("换一个呢")
-        self.assertIn("修改旧任务", reply.answer)
-        self.assertEqual(self.workflow.state.task_id, task_id)
-        self.assertEqual(self.workflow.state.revision, 1)
-
-    def test_failure_and_forced_fast(self):
-        self.workflow.handle("比较方案", "fast")
-        self.assertIsNone(self.workflow.state)
-        self.llm.fail = True
-        self.workflow.handle("比较方案")
-        reply = self.complete()
-        self.assertIn("没能完成", reply.answer)
-        self.assertEqual(self.workflow.state.status, "failed")
-
-    def test_defer_suppresses_notification(self):
-        self.workflow.handle("比较方案")
+    def test_completed_undelivered_not_overwritten(self):
+        self.start()
         self.workflow.handle("你好")
-        self.workflow.state.notified = True
-        self.assertIsNone(self.complete())
+        self.finish()
+        task_id = self.workflow.state.task_id
+        self.workflow.handle("分析一个新方案")
+        self.assertEqual(self.workflow.state.task_id, task_id)
+        self.assertFalse(self.workflow.state.delivered)
+
+    def test_slow_failure_enters_fast_event_without_fake_analysis(self):
+        self.llm.fail = True
+        self.start()
+        reply = self.finish()[0]
+        self.assertIn("失败", reply.answer)
+        self.assertEqual(self.workflow.state.status, "failed")
+        self.assertEqual(self.llm.fast_inputs[-1]["event"], "slow_failed")
+        self.assertIsNone(self.llm.fast_inputs[-1]["analysis_result"])
+
+    def test_sync_before_user_message_routes_latest_completed_state(self):
+        self.start()
+        self.llm.release.set()
+        self.workflow.pending[1].result(timeout=1)
+        reply = self.workflow.handle("/status")
+        self.assertIn("completed", reply.answer)
+        self.assertEqual(self.llm.fast_inputs[-1]["task_state"]["status"], "completed")
+
+    def test_rejected_action_corrected_once_without_false_promise(self):
+        self.start()
+        task_id = self.workflow.state.task_id
+        def override(ctx):
+            if ctx["event"] == "user_message":
+                return response("start_slow", "错误承诺：新任务已经开始", "新任务")
+        self.llm.override = override
+        reply = self.workflow.handle("另一个问题")
+        self.assertNotIn("错误承诺", reply.answer)
+        self.assertIn("SLOW_BUSY", reply.answer)
+        self.assertEqual(self.workflow.state.task_id, task_id)
+        self.assertEqual(len(self.llm.slow_inputs), 1)
+        self.assertEqual(self.llm.fast_inputs[-1]["event"], "action_failed")
+        self.assertFalse(any("错误承诺" in m["content"] for m in self.memory.messages))
+
+    def test_wrong_target_and_repeated_action_in_correction_never_execute(self):
+        self.start()
+        task_id = self.workflow.state.task_id
+        self.llm.override = lambda ctx: response("cancel_slow", "取消了", target="wrong")
+        with self.assertRaises(AgentError):
+            self.workflow.handle("取消")
+        self.assertEqual(self.workflow.state.task_id, task_id)
+        self.assertEqual(self.workflow.state.status, "running")
+        self.assertEqual(len(self.llm.fast_inputs), 3)  # start + decision + one correction
+
+    def test_invalid_json_action_or_missing_task_leaves_state_unchanged(self):
+        self.start()
+        task_id = self.workflow.state.task_id
+        for invalid in ({"respond": "x", "action": {"type": "shell"}}, response("start_slow", task=None)):
+            self.llm.override = lambda ctx, value=invalid: value
+            with self.assertRaises(AgentError):
+                self.workflow.handle("无效输出")
+            self.assertEqual(self.workflow.state.task_id, task_id)
+            self.assertEqual(self.workflow.state.status, "running")
+        with self.assertRaises(AgentError):
+            parse_json_object("not JSON")
+
+    def test_fast_and_slow_modes_still_enter_fast(self):
+        self.workflow.handle("分析问题", "fast")
+        self.assertIsNone(self.workflow.state)
+        self.workflow.handle("你好", "slow")
+        self.assertEqual(self.workflow.state.status, "running")
+        self.assertEqual([c["mode"] for c in self.llm.fast_inputs], ["fast", "slow"])
+
+    def test_explicit_cancel_cannot_be_ignored_by_model(self):
+        self.start()
+        self.llm.override = lambda ctx: response("none", "已经取消") if ctx["event"] == "user_message" else None
+        reply = self.workflow.handle("/cancel")
+        self.assertIn("COMMAND_ACTION_MISMATCH", reply.answer)
+        self.assertEqual(self.workflow.state.status, "running")
+
+    def test_state_change_during_fast_call_corrects_stale_status(self):
+        self.start()
+        def override(ctx):
+            if ctx["event"] == "user_message":
+                self.llm.release.set()
+                self.workflow.pending[1].result(timeout=1)
+                return response("get_status", "旧状态：仍在分析", target=self.workflow.state.task_id)
+        self.llm.override = override
+        reply = self.workflow.handle("/status")
+        self.assertNotIn("旧状态", reply.answer)
+        self.assertEqual(self.workflow.state.status, "completed")
+        self.assertEqual(self.llm.fast_inputs[-1]["task_state"]["status"], "completed")
+
+    def test_defer_and_silent_event_do_not_repeat(self):
+        self.start()
+        self.workflow.handle("稍后再看")
+        self.assertEqual(self.finish(), [])
         self.assertIsNotNone(self.workflow.state.result)
 
-    def test_invalid_action_rejected(self):
+    def test_silent_completion_not_written_as_message(self):
+        self.start()
+        self.llm.override = lambda ctx: response(respond=None) if ctx["event"] == "slow_completed" else None
+        size = len(self.memory.messages)
+        self.assertEqual(self.finish(), [])
+        self.assertEqual(len(self.memory.messages), size)
+        self.assertIsNotNone(self.workflow.state.result)
+        self.assertIsNone(self.workflow.poll())
+
+    def test_same_topic_does_not_force_topic_switch(self):
+        self.start()
+        self.llm.override = lambda ctx: {**response(respond="明白"), "topic_relation": "same_task"}
+        self.workflow.handle("我的意思是保持原范围")
+        self.assertFalse(self.workflow.state.topic_switched)
+
+    def test_close_discards_background_events(self):
+        self.start()
+        self.workflow.close()
+        self.llm.release.set()
+        self.assertIsNone(self.workflow.poll())
+        self.assertEqual(self.workflow.state.status, "cancelled")
+        fresh = Workflow(self.llm, Memory(), Config())
+        try:
+            self.assertIsNone(fresh.state)
+            self.assertIsNone(fresh.poll())
+        finally:
+            fresh.close()
+
+
+class SchemaTests(unittest.TestCase):
+    def test_required_fields_and_action_whitelist(self):
+        for value in [None, {"type": []}, {"type": "exec"}, {"type": "update_slow", "task": "full"},
+                      {"type": "none", "task": "unexpected"}, {"type": "none", "target_task_id": "id"}]:
+            with self.assertRaises(AgentError):
+                Action.parse(value)
+
+    def test_only_event_none_may_be_silent(self):
         with self.assertRaises(AgentError):
-            FastResult.parse({"action": "unknown", "answer": "x", "analysis_task": "", "route_reason": "x"})
+            FastResponse.parse(response(respond=None))
+        self.assertIsNone(FastResponse.parse(response(respond=None), allow_silent=True).respond)
+        with self.assertRaises(AgentError):
+            FastResponse.parse(response("get_status", respond=None), allow_silent=True)
 
 
 class HTTPTests(unittest.TestCase):

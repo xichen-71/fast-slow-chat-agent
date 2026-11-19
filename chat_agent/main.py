@@ -24,7 +24,7 @@ def read_input(events):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="会话内记忆＋单后台慢任务实验")
+    parser = argparse.ArgumentParser(description="Fast–Slow V2 最小后台任务实验")
     parser.add_argument("--demo", action="store_true", help="固定示例，不是真实推理")
     parser.add_argument("--demo-delay", type=float, default=4, help="演示慢任务耗时秒数")
     parser.add_argument("--mode", choices=("auto", "fast", "slow"), default="auto")
@@ -54,7 +54,7 @@ def main():
     try:
         while True:
             try:
-                # 优先处理已到达的输入，取消等指令先于完成反馈生效。
+                # 优先处理输入；handle 会先同步后台事实，再交给 Fast，通知在回复边界处理。
                 message = events.get(timeout=0.1)
             except queue.Empty:
                 message = ""

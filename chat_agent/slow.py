@@ -7,7 +7,7 @@ from .llm import LLM
 from .schemas import Analysis
 
 
-class SlowChannel:
+class SlowAgent:
     def __init__(self, llm: LLM):
         self.llm = llm
         self.prompt = (Path(__file__).parent / "prompts/slow.md").read_text(encoding="utf-8")

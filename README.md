@@ -1,43 +1,27 @@
-# 快慢通道 Agent：最小后台任务版
+# Fast–Slow Chat Agent V2（最小运行版）
 
-完整设计见 [新方案说明](新方案说明.md)。Python 3.10+，标准库实现，无需安装运行依赖。
+Fast 负责理解和全部自然回复，Slow 后台分析，Workflow 校验动作并维护真实状态。
+Python 3.10+，仅标准库，无需安装运行依赖。详细设计见 [新方案说明](新方案说明.md)。
 
-## 离线演示
+## 运行
 
 ```bash
-cd '/Users/chenxi/Desktop/聊天agent/项目实现'
 python3 -m chat_agent.main --demo
 ```
 
-依次输入：
+离线演示依次输入：
 
-1. `比较方案`：固定示例启动慢任务（默认延迟 4 秒）。
-2. 在其完成前输入 `你好`：FAST 接话。
-3. 输入 `比较另一个方案`：提示上一任务仍在处理。
-4. 等待完成提醒，输入 `要` 或 `/result`：查看结果。
+1. `比较两个方案`：启动 Slow（默认模拟 4 秒）。
+2. 未完成前输入 `线程是什么`：Fast 回答，旧任务继续。
+3. `另外分析一个项目`：Fast 说明忙碌，不接新任务。
+4. `刚才改为重点看成本`：新任务 ID，旧结果失效。
+5. `再加入维护难度`：只保留最新待执行要求。
+6. 聊点别的，等 Fast 提醒后输入 `要` 或 `/result` 查看。
 
-演示按关键词返回固定数据，不会真实推理。可用 `--demo-delay 10` 延长等待，便于手动实验。
+可用 `--demo-delay 10` 留出实验时间，`--quiet` 隐藏 trace，始终保留 FAST/SLOW respond 标签。
+Demo 用固定响应和关键词演示协议，不做真实分析，不可用于评价语义判断。
 
-## 修改旧任务与提出新任务
-
-真实模式由 Fast LLM 判断，Workflow 校验并执行：
-
-| 用户表达 | action | 实际处理 |
-| --- | --- | --- |
-| “刚才那个，改为只比较成本” | replace | 校验目标 ID，更新完整要求，revision +1 |
-| “另外分析一下另一个项目” | start_slow | 原任务运行中则提示等待，不自动接下或排队 |
-| “顺便解释一下异步” | direct | 快答，原任务继续 |
-| 指代不明，如“换一个呢” | direct | 先询问确认，保留旧任务 |
-
-同一任务修改时保留 task_id，原始问题不变；analysis_task 保存完整最新要求。
-连续修改只保留一个最新待执行快照。例如 v1 运行时收到 v2/v3，只在 v1 结束后执行 v3。
-取消会清空待执行快照；旧 ID、旧 revision、已取消的结果一律不采用。
-
-演示模式可输入 `比较方案` → `改为只比较成本` → `改为加入维护难度`，观察
-`task_revised`、`slow_queued_latest`、`slow_ignored` 日志。演示只做固定拼接，不能用于评估语义分类或条件合并质量。
-真实模型的条件合并仍可能出错；默认 trace 显示修改前后要求，方便核对。
-
-## 连接模型
+## 连接真实模型
 
 ```bash
 cp .env.example .env
@@ -45,39 +29,53 @@ cp .env.example .env
 python3 -m chat_agent.main
 ```
 
-模型服务须支持 Chat Completions 的 system/user/assistant 消息和 JSON 文本输出。
-`LLM_BASE_URL` 填接口前缀（如 https://服务域名/v1），不含 /chat/completions。
-`SLOW_MODEL` 留空则共用快模型。按供应商要求选择 `LLM_TOKEN_FIELD`，支持时可开启 JSON mode。
-请求格式参考 [官方接口文档](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
+BASE_URL 为 Chat Completions 接口前缀（如 https://服务域名/v1），程序追加 /chat/completions。
+SLOW_MODEL 留空则共用快模型。按服务要求选 LLM_TOKEN_FIELD；支持时可打开 LLM_JSON_MODE。
+.env 不执行 shell、不展开变量，已有环境变量优先。最近对话会发送给配置的服务。
 
-`.env` 为简单 KEY=value，可使用成对引号；不执行脚本、不展开变量，已有环境变量优先。
-当前消息和截取后的最近对话会发送给配置的服务；未接搜索和长期记忆。
+## 最小工作流
 
-## 命令
+```text
+用户消息 → 同步后台事实 → Fast 返回 respond + action
+    → Workflow 校验执行 → 成功则展示；失败/状态变化则 Fast 修正一次
+Slow 完成/失败 → 保存事实 → 系统事件进入 Fast → 交付、提醒或暂不打断
+```
+
+所有普通话术都由 Fast 生成，不再由 Workflow 固定输出“忙碌/完成/取消”答案。
+程序只在技术错误或 CLI 控制时输出诊断。Fast prompt 包含逐场景规则和示例，见
+[fast.md](chat_agent/prompts/fast.md)。
+
+统一格式：
+
+```json
+{"respond":"自然回复", "action":{"type":"none", "task":null, "target_task_id":null}}
+```
+
+动作：none、start_slow、update_slow、cancel_slow、get_status、get_result、defer_result、discard_result。
+只有系统事件的 none 可 respond=null，不打断用户。修改任务必须带完整新要求和有效目标 ID。
+动作失败只修正一次回复，不重试动作；非法输出安全报错。代码无法完全检测任意自然语言中的虚假承诺，仍需真实模型评测。
+
+## CLI
 
 | 命令 | 作用 |
 | --- | --- |
-| `/status` | 查看当前任务状态 |
-| `/result` | 将已完成结果交给快通道整理后显示 |
-| `/cancel` | 取消任务，忽略晚到结果 |
-| `/discard` | 丢弃旧任务或结果；之后重新提出新问题 |
-| `/new` | 清空会话，旧任务不再向新会话输出 |
-| `/mode auto` | 模型判断是否调用慢通道 |
-| `/mode fast` | 不创建慢任务 |
-| `/mode slow` | 强制普通消息启动慢分析；任务管理用命令 |
-| `/exit` | 退出；已发送的 HTTP 可能需等返回或超时 |
+| `/status` | 经 Fast 查询真实任务状态 |
+| `/result` | 经 Fast 整理已完成结果 |
+| `/cancel`、`/discard` | 经 Fast 明确取消/丢弃，Workflow 验证动作 |
+| `/new` | 清空会话；旧结果不会串入新会话 |
+| `/mode auto` | Fast 按问题和状态分流 |
+| `/mode fast` | 禁止启动/更新 Slow，管理旧任务仍可 |
+| `/mode slow` | 普通问题要求 Slow，仍经 Fast 并受单任务约束 |
+| `/exit` | 退出；已发出 HTTP 可能需等返回或超时 |
 
-`--quiet` 隐藏 trace，仍显示 FAST/SLOW 标签。模型自然语言识别存在误判，命令入口是确定性的。
+## 范围和限制
 
-## 当前边界
-
-- memory 为进程内消息列表，state 只存当前慢任务。重启不恢复，旧版 SQLite 不再读取。
-- 一个运行中的慢任务，不自动接收、排队第二个复杂问题。
-- 已完成未展示的结果不会被新问题覆盖。
-- 取消不保证中断远端 HTTP，但旧结果一定不再被采用。
-- 先实现深度分析；尚未接联网、知识库或长期记忆检索。
-- 快通道默认输出预算 800，慢通道 2400；这是上限，不保证速度或质量。
-- 不流式输出；快调用期间输入可入队，输出与状态变更仍串行处理。
+- 进程内 memory/state，无长期记忆、检索、联网、工具操作、LangGraph 或 Web UI。
+- 一个有效慢任务，一个 worker；独立的新复杂任务不排队；已完成未交付结果不被静默覆盖。
+- update_slow 新建 ID；连续更新只保留最新快照，取消清空快照，旧结果无法写回。
+- 完成/失败事件最多处理一次；结果保存，稍后可查询。事件生成失败可 /result 或 /status 恢复。
+- 主线程串行处理 Fast 和输出，后台 Slow 独立运行；服务端也需允许并发，否则快回复可能被拖慢。
+- Fast/Slow 主要由角色与预算区分，不保证同模型深分析一定更准；未接真实模型验证。
 
 ## 测试
 
@@ -85,4 +83,6 @@ python3 -m chat_agent.main
 python3 -m unittest discover -s tests -v
 ```
 
-测试使用模拟模型，不访问网络，覆盖连续修改仅执行最新版、目标 ID 错误、取消清空待执行任务、取消后新建、旧版本晚到及原有快慢流程。真实模型分流质量、条件保留情况、服务并发能力与响应速度需配置后验证。
+测试使用模拟模型与模拟 HTTP，不需要密钥。覆盖协议、后台任务、状态同步、失败修正、隔离与 CLI 模式。
+
+V1 的 revision+固定话术协议已被 V2 替换；保留原有模块布局、配置方法和 CLI 入口。
