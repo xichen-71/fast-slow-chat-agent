@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-slow-chat-agent"
+version = "0.1.0"
+description = "用于实验快慢通道的最小聊天 agent"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.package-data]
+chat_agent = ["prompts/*.md"]
+
+[tool.setuptools.packages.find]
+include = ["chat_agent*"]
